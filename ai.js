@@ -10,9 +10,7 @@ const AI_ROOM_SIZE = window.ROOM_SIZE || 8;
 // AI 상태
 const aiState = {
     position: { x: 0, y: -4 }, // 최북단에서 시작
-    targetPosition: { x: 0, y: 4 }, // 최남단 가운데가 목표
-    waypoint: { x: 1, y: 0 }, // 동쪽 중앙 방을 경유
-    reachedWaypoint: false, // 경유점 도달 여부
+    targetPosition: { x: 0, y: 4 }, // 최남단 가운데가 목표 (initAI에서 체크포인트로 업데이트됨)
     mesh: null, // 3D 메시
     path: [], // 이동 경로
     currentPathIndex: 0,
@@ -22,16 +20,12 @@ const aiState = {
     checkingPath: false, // 경로 체크 중 플래그
     health: 100, // AI 체력
     maxHealth: 100,
-    canShoot: true,
-    shootCooldown: 0,
-    lastShootTime: 0,
-    detectionRange: 15, // 플레이어 감지 범위
     lastRoomCreateTime: 0, // 마지막 방 생성 시간 (밀리초)
-    roomCreateCooldown: 500 // 방 생성 쿨다운 (0.5초)
+    roomCreateCooldown: 500, // 방 생성 쿨다운 (0.5초)
+    stuckFrames: 0, // 연속으로 낑긴 프레임 수
+    lastStuckCheck: 0 // 마지막 낑김 체크 시간
 };
 
-// AI 총알 배열
-const aiBullets = [];
 
 
 // AI 메시 생성
@@ -57,7 +51,7 @@ function createAIMesh() {
     return aiMesh;
 }
 
-// 문 통과 가능 여부 확인 (경로 탐색용 - 방이 없어도 통과 가능하다고 가정, 가상의 경로)
+// 문 통과 가능 여부 확인 (경로 탐색용 - 플레이어가 만든 방도 인식)
 function canPassDoorForPathfinding(gridX, gridY, direction) {
     const getTargetGridFunc = window.getTargetGrid;
     if (!getTargetGridFunc) return false;
@@ -68,20 +62,31 @@ function canPassDoorForPathfinding(gridX, gridY, direction) {
         return false;
     }
     
-    // 경로 탐색용이므로 방이 없어도 통과 가능 (가상의 경로)
-    // 현재 방이 생성되어 있으면 문이 있는지 확인하지만, 없어도 가상으로 통과 가능
     const gameState = window.gameState;
-    if (gameState) {
-        const currentRoom = gameState.rooms.get(`${gridX},${gridY}`);
-        // 현재 방이 생성되어 있고 문이 없으면 통과 불가
-        if (currentRoom && currentRoom.generated) {
-            if (!currentRoom.doors.includes(direction)) {
-                return false; // 현재 방에 문이 없으면 통과 불가
-            }
+    if (!gameState) return false;
+    
+    const currentRoom = gameState.rooms.get(`${gridX},${gridY}`);
+    const targetRoom = gameState.rooms.get(`${targetGrid.x},${targetGrid.y}`);
+    
+    // 현재 방이 생성되어 있으면 문이 있는지 확인
+    if (currentRoom && currentRoom.generated) {
+        if (!currentRoom.doors.includes(direction)) {
+            return false; // 현재 방에 문이 없으면 통과 불가
         }
     }
     
-    // 목표 방이 없어도 통과 가능 (가상의 경로, AI가 생성할 수 있음)
+    // 목표 방이 이미 생성되어 있으면 (플레이어가 만든 방) 반대편 문도 확인
+    if (targetRoom && targetRoom.generated) {
+        const oppositeDir = (direction + 2) % 4;
+        // 목표 방에 반대 방향 문이 있어야 통과 가능
+        if (!targetRoom.doors.includes(oppositeDir)) {
+            return false; // 목표 방에 반대편 문이 없으면 통과 불가
+        }
+        // 양쪽 방 모두 문이 있으면 통과 가능
+        return true;
+    }
+    
+    // 목표 방이 없으면 통과 가능 (가상의 경로, AI가 생성할 수 있음)
     return true;
 }
 
@@ -465,90 +470,55 @@ function findPath(startX, startY, targetX, targetY) {
     return null; // 경로를 찾을 수 없음
 }
 
-// AI 경로 업데이트 (20초마다 또는 경로가 없을 때만)
+// AI 경로 업데이트 (꾸준히 재탐색)
 function updateAIPath() {
-    if (aiState.reached || aiState.checkingPath) return;
+    if (aiState.reached) return;
     
-    // 목표에 이미 도달했는지 확인
-    if (aiState.position.x === aiState.targetPosition.x && 
-        aiState.position.y === aiState.targetPosition.y) {
-        aiState.reached = true;
-        console.log('AI가 목표에 도달했습니다!');
-        return;
+    // checkingPath가 true이면 이미 경로 탐색 중이므로 스킵 (너무 자주 호출 방지)
+    // 하지만 0.5초 이상 경로 탐색 중이면 타임아웃으로 리셋 (더 빠르게)
+    if (aiState.checkingPath) {
+        const now = Date.now();
+        if (now - aiState.lastPathCheckTime > 500) {
+            console.log('AI checkingPath 타임아웃, 강제 리셋');
+            aiState.checkingPath = false;
+        } else {
+            return; // 아직 경로 탐색 중
+        }
     }
+    
+    // 목표 그리드에 도달했는지 확인 (실제 체크포인트 도달은 checkGameEnd에서 확인)
+    // 그리드 도달 후에도 실제 체크포인트 위치까지 이동하도록 경로 탐색을 계속함
     
     const now = Date.now();
     const timeSinceLastCheck = now - aiState.lastPathCheckTime;
-    
-    // 목표 방에 가까운지 확인 (2칸 이내)
-    const distToTarget = Math.abs(aiState.position.x - aiState.targetPosition.x) + 
-                         Math.abs(aiState.position.y - aiState.targetPosition.y);
-    const isNearTarget = distToTarget <= 2;
-    
-    // 목표에 가까우면 경로 재탐색 빈도 줄이기 (정신 못 차리는 것 방지)
+    // 경로를 꾸준히 재탐색 (경로가 없거나 끝에 도달했을 때는 즉시, 그 외에는 3초마다)
     const shouldCheck = aiState.path.length === 0 || 
                         aiState.currentPathIndex >= aiState.path.length ||
-                        (isNearTarget ? timeSinceLastCheck >= 5000 : timeSinceLastCheck >= 20000); // 가까우면 5초, 멀면 20초
+                        timeSinceLastCheck >= 3000; // 3초마다 재탐색 (정상 이동 중에는 덜 자주)
     
     if (shouldCheck) {
         aiState.checkingPath = true;
         aiState.lastPathCheckTime = now;
         
-        // 경유점을 거쳐서 가는 경로 계산
-        let newPath = [];
-        
-        // 현재 위치가 경유점에 도달했는지 확인
-        if (!aiState.reachedWaypoint) {
-            // 1단계: 현재 위치 → 경유점 (동쪽 중앙 방)
-            const pathToWaypoint = findPath(
-                aiState.position.x, 
-                aiState.position.y,
-                aiState.waypoint.x,
-                aiState.waypoint.y
-            );
-            
-            if (pathToWaypoint && pathToWaypoint.length > 0) {
-                // 2단계: 경유점 → 목표점
-                const pathFromWaypoint = findPath(
-                    aiState.waypoint.x,
-                    aiState.waypoint.y,
-                    aiState.targetPosition.x,
-                    aiState.targetPosition.y
-                );
-                
-                if (pathFromWaypoint && pathFromWaypoint.length > 0) {
-                    // 두 경로를 합치기 (경유점은 중복 제거)
-                    newPath = [...pathToWaypoint, ...pathFromWaypoint.slice(1)];
-                } else {
-                    // 경유점에서 목표로 가는 경로를 못 찾으면 경유점까지만
-                    newPath = pathToWaypoint;
-                }
-            }
-        } else {
-            // 경유점에 도달했으면 경유점 → 목표점 경로만
-            const pathFromWaypoint = findPath(
-                aiState.waypoint.x,
-                aiState.waypoint.y,
-                aiState.targetPosition.x,
-                aiState.targetPosition.y
-            );
-            
-            if (pathFromWaypoint && pathFromWaypoint.length > 0) {
-                newPath = pathFromWaypoint;
-            }
-        }
+        // 현재 위치에서 목표로 직접 가는 경로 계산
+        const newPath = findPath(
+            aiState.position.x, 
+            aiState.position.y,
+            aiState.targetPosition.x,
+            aiState.targetPosition.y
+        );
         
         if (newPath && newPath.length > 0) {
             aiState.path = newPath;
             aiState.currentPathIndex = 1; // 시작점 제외
-            console.log('AI 경로 탐색 완료 (경유점 포함):', newPath);
+            console.log('AI 경로 탐색 완료:', newPath);
         } else {
             // 경로를 찾을 수 없으면 목표 방향으로 새 방 생성하여 이동
             console.log('AI 경로를 찾을 수 없습니다. 목표 방향으로 새 방 생성 시도...');
             
             // 목표 방향 계산
-            const targetX = !aiState.reachedWaypoint ? aiState.waypoint.x : aiState.targetPosition.x;
-            const targetY = !aiState.reachedWaypoint ? aiState.waypoint.y : aiState.targetPosition.y;
+            const targetX = aiState.targetPosition.x;
+            const targetY = aiState.targetPosition.y;
             
             // 현재 위치에서 목표로 가는 가장 가까운 방향 찾기
             const dx = targetX - aiState.position.x;
@@ -571,6 +541,16 @@ function updateAIPath() {
             } else if (dx < 0) {
                 nextX -= 1; // 서쪽
                 direction = 3;
+            }
+            
+            // 목표 그리드에 도달했는지 확인
+            if (dx === 0 && dy === 0) {
+                // 이미 목표 그리드에 도달 (실제 체크포인트 도달은 checkGameEnd에서 확인)
+                console.log('AI가 목표 그리드에 도달했습니다. (경로 탐색 실패 시)');
+                aiState.path = [];
+                aiState.currentPathIndex = 0;
+                aiState.checkingPath = false;
+                return;
             }
             
             // 그리드 범위 체크
@@ -620,8 +600,22 @@ function updateAIPath() {
                     
                     if (!found) {
                         console.log('AI 모든 방향으로 방 생성 실패 또는 쿨다운 중');
+                        // 경로를 찾을 수 없어도 포기하지 않고 다음에 다시 시도
+                        // 경로를 빈 배열로 두면 다음 프레임에 다시 경로 탐색 시도
+                        aiState.path = [];
+                        aiState.currentPathIndex = 0;
+                    } else {
+                        // 방 생성 쿨다운 중이면 다음에 다시 시도
+                        console.log('AI 방 생성 쿨다운 중, 다음에 다시 시도');
+                        aiState.path = [];
+                        aiState.currentPathIndex = 0;
                     }
                 }
+            } else {
+                // 그리드 범위를 벗어나면 경로를 찾을 수 없음
+                console.log('AI 목표가 그리드 범위를 벗어남');
+                aiState.path = [];
+                aiState.currentPathIndex = 0;
             }
         }
         
@@ -633,40 +627,149 @@ function updateAIPath() {
 let lastMovementUpdate = 0;
 
 function updateAIMovement() {
-    if (!aiState.mesh || aiState.reached) return;
+    if (!aiState.mesh) return;
+    
+    // reached가 true여도 실제 체크포인트 위치까지 이동하도록 허용
+    // checkGameEnd에서 실제 체크포인트 도달을 확인함
     
     const now = Date.now();
     
-    // 경로가 없으면 경로 재탐색 시도 (1초마다만)
+    // 경로가 없으면 경로 재탐색 시도 또는 목표 그리드에 도달했으면 체크포인트로 이동
     if (aiState.path.length === 0) {
-        if (now - lastMovementUpdate >= 1000) {
-            updateAIPath();
-            lastMovementUpdate = now;
+        // 목표 그리드에 도달했으면 체크포인트 위치로 직접 이동
+        if (aiState.position.x === aiState.targetPosition.x && 
+            aiState.position.y === aiState.targetPosition.y) {
+            const gameState = window.gameState;
+            if (gameState && gameState.aiCheckpoint) {
+                const checkpointPos = gameState.aiCheckpoint.position;
+                const currentWorldX = aiState.mesh.position.x;
+                const currentWorldZ = aiState.mesh.position.z;
+                const targetWorldX = checkpointPos.x;
+                const targetWorldZ = checkpointPos.z;
+                
+                const distX = targetWorldX - currentWorldX;
+                const distZ = targetWorldZ - currentWorldZ;
+                const distance = Math.sqrt(distX * distX + distZ * distZ);
+                
+                if (distance > 0.1) {
+                    // 체크포인트 방향으로 이동 (방 경계 체크 없이 직접 이동)
+                    const moveX = (distX / distance) * aiState.speed;
+                    const moveZ = (distZ / distance) * aiState.speed;
+                    aiState.mesh.position.x += moveX;
+                    aiState.mesh.position.z += moveZ;
+                }
+                lastMovementUpdate = now;
+                return;
+            }
         }
-        return;
+        updateAIPath(); // checkingPath 체크는 updateAIPath 내부에서 처리
+        lastMovementUpdate = now;
+        return; // 경로가 없으면 이동 불가
     }
     
     // 현재 방이 생성되어 있는지 확인 (없으면 생성 불가능하므로 경로 재탐색)
     const currentKey = `${aiState.position.x},${aiState.position.y}`;
     const currentRoom = window.gameState?.rooms.get(currentKey);
     if (!currentRoom || !currentRoom.generated) {
-        // 현재 방이 없으면 경로 재탐색 (1초마다만)
-        if (now - lastMovementUpdate >= 1000) {
-            console.log('AI 현재 방이 없음, 경로 재탐색');
-            aiState.path = [];
-            aiState.currentPathIndex = 0;
-            updateAIPath();
-            lastMovementUpdate = now;
-        }
+        // 현재 방이 없으면 경로 재탐색
+        console.log('AI 현재 방이 없음, 경로 재탐색');
+        aiState.path = [];
+        aiState.currentPathIndex = 0;
+        updateAIPath();
+        lastMovementUpdate = now;
         return;
     }
     
     if (aiState.currentPathIndex >= aiState.path.length) {
-        // 경로의 끝에 도달했지만 목표가 아닐 수 있음 (1초마다만)
-        if (now - lastMovementUpdate >= 1000) {
-            updateAIPath();
+        // 경로의 끝에 도달했지만 목표가 아닐 수 있음
+        // 목표 그리드에 도달했는지 확인
+        if (aiState.position.x === aiState.targetPosition.x && 
+            aiState.position.y === aiState.targetPosition.y) {
+            // 목표 그리드에 도달했으면 체크포인트 위치로 직접 이동
+            const gameState = window.gameState;
+            if (gameState && gameState.aiCheckpoint) {
+                const checkpointPos = gameState.aiCheckpoint.position;
+                const currentWorldX = aiState.mesh.position.x;
+                const currentWorldZ = aiState.mesh.position.z;
+                const targetWorldX = checkpointPos.x;
+                const targetWorldZ = checkpointPos.z;
+                
+                const distX = targetWorldX - currentWorldX;
+                const distZ = targetWorldZ - currentWorldZ;
+                const distance = Math.sqrt(distX * distX + distZ * distZ);
+                
+                if (distance > 0.1) {
+                    // 체크포인트 방향으로 이동
+                    const moveX = (distX / distance) * aiState.speed;
+                    const moveZ = (distZ / distance) * aiState.speed;
+                    aiState.mesh.position.x += moveX;
+                    aiState.mesh.position.z += moveZ;
+                }
+            }
+            // 경로는 비워서 더 이상 경로 탐색하지 않음
+            aiState.path = [];
+            aiState.currentPathIndex = 0;
             lastMovementUpdate = now;
+            return;
         }
+        // 목표가 아니면 목표 방향으로 직접 이동 시도
+        const dx = aiState.targetPosition.x - aiState.position.x;
+        const dy = aiState.targetPosition.y - aiState.position.y;
+        
+        // 목표 방향 계산
+        let nextX = aiState.position.x;
+        let nextY = aiState.position.y;
+        let direction = -1;
+        
+        if (dy > 0) {
+            nextY += 1; // 남쪽
+            direction = 2;
+        } else if (dy < 0) {
+            nextY -= 1; // 북쪽
+            direction = 0;
+        } else if (dx > 0) {
+            nextX += 1; // 동쪽
+            direction = 1;
+        } else if (dx < 0) {
+            nextX -= 1; // 서쪽
+            direction = 3;
+        }
+        
+        // 목표 방향으로 방이 있는지 확인
+        const targetKey = `${nextX},${nextY}`;
+        const targetRoom = window.gameState?.rooms.get(targetKey);
+        
+        // 방이 없거나 생성되지 않았으면 생성 시도
+        if ((!targetRoom || !targetRoom.generated) && direction !== -1 && 
+            nextX >= -2 && nextX <= 2 && nextY >= -4 && nextY <= 4 &&
+            now - aiState.lastRoomCreateTime >= aiState.roomCreateCooldown) {
+            console.log(`AI 경로 끝, 목표 방향으로 방 생성 시도: (${nextX}, ${nextY})`);
+            const created = aiCreateRoom(nextX, nextY, direction);
+            if (created) {
+                aiState.path = [
+                    { x: aiState.position.x, y: aiState.position.y },
+                    { x: nextX, y: nextY }
+                ];
+                aiState.currentPathIndex = 1;
+                aiState.lastRoomCreateTime = now;
+                console.log('AI 목표 방향으로 방 생성 성공');
+            } else {
+                // 방 생성 실패 시 경로 재탐색
+                updateAIPath();
+            }
+        } else if (targetRoom && targetRoom.generated) {
+            // 방이 이미 있으면 경로에 추가
+            aiState.path = [
+                { x: aiState.position.x, y: aiState.position.y },
+                { x: nextX, y: nextY }
+            ];
+            aiState.currentPathIndex = 1;
+            console.log('AI 목표 방향 방 발견, 경로에 추가');
+        } else {
+            // 그 외의 경우 경로 재탐색
+            updateAIPath();
+        }
+        lastMovementUpdate = now;
         return;
     }
     
@@ -725,11 +828,12 @@ function updateAIMovement() {
                 }
                 
                 if (!found) {
-                    // 모든 방향 실패 시 경로 재탐색 (1초 후)
-                    console.log('AI 모든 방향으로 방 생성 실패, 경로 재탐색 예약');
+                    // 모든 방향 실패 시 경로 재탐색 (즉시)
+                    console.log('AI 모든 방향으로 방 생성 실패, 경로 재탐색');
                     aiState.path = [];
                     aiState.currentPathIndex = 0;
-                    lastMovementUpdate = now; // 재탐색 쿨다운 설정
+                    updateAIPath(); // 즉시 재탐색
+                    lastMovementUpdate = now;
                 }
             }
         }
@@ -771,11 +875,12 @@ function updateAIMovement() {
             }
             
             if (!found) {
-                // 모든 방향 실패 시 경로 재탐색 (1초 후)
-                console.log('AI 모든 방향으로 방 생성 실패, 경로 재탐색 예약');
+                // 모든 방향 실패 시 경로 재탐색 (즉시)
+                console.log('AI 모든 방향으로 방 생성 실패, 경로 재탐색');
                 aiState.path = [];
                 aiState.currentPathIndex = 0;
-                lastMovementUpdate = now; // 재탐색 쿨다운 설정
+                updateAIPath(); // 즉시 재탐색
+                lastMovementUpdate = now;
             }
         }
         return;
@@ -797,47 +902,39 @@ function updateAIMovement() {
         aiState.position = { x: currentTarget.x, y: currentTarget.y };
         aiState.currentPathIndex++;
         
-        // 경유점에 도달했는지 확인
-        if (!aiState.reachedWaypoint && 
-            aiState.position.x === aiState.waypoint.x && 
-            aiState.position.y === aiState.waypoint.y) {
-            aiState.reachedWaypoint = true;
-            console.log('AI가 경유점(동쪽 중앙 방)에 도달했습니다!');
-            // 경로 재탐색
-            aiState.path = [];
-            aiState.currentPathIndex = 0;
-            updateAIPath();
-            return;
-        }
-        
-        // 목표에 도달했는지 확인
+        // 목표 그리드에 도달했는지 확인
         if (aiState.position.x === aiState.targetPosition.x && 
             aiState.position.y === aiState.targetPosition.y) {
-            aiState.reached = true;
-            console.log('AI가 목표에 도달했습니다!');
+            // 목표 그리드에 도달했으면 체크포인트 위치로 직접 이동
+            const gameState = window.gameState;
+            if (gameState && gameState.aiCheckpoint) {
+                const checkpointPos = gameState.aiCheckpoint.position;
+                const currentWorldX = aiState.mesh.position.x;
+                const currentWorldZ = aiState.mesh.position.z;
+                const targetWorldX = checkpointPos.x;
+                const targetWorldZ = checkpointPos.z;
+                
+                const distX = targetWorldX - currentWorldX;
+                const distZ = targetWorldZ - currentWorldZ;
+                const distance = Math.sqrt(distX * distX + distZ * distZ);
+                
+                if (distance > 0.1) {
+                    // 체크포인트 방향으로 이동
+                    const moveX = (distX / distance) * aiState.speed;
+                    const moveZ = (distZ / distance) * aiState.speed;
+                    aiState.mesh.position.x += moveX;
+                    aiState.mesh.position.z += moveZ;
+                }
+            }
+            // 경로는 비워서 더 이상 경로 탐색하지 않음
+            aiState.path = [];
+            aiState.currentPathIndex = 0;
             return;
         }
         
         // 다음 경로를 위해 업데이트
-        // 목표에 가까우면 경로 재탐색하지 않고 직접 목표로 이동
-        const distToTarget = Math.abs(aiState.position.x - aiState.targetPosition.x) + 
-                           Math.abs(aiState.position.y - aiState.targetPosition.y);
-        
         if (aiState.currentPathIndex >= aiState.path.length) {
-            if (distToTarget <= 2) {
-                // 목표에 가까우면 직접 목표로 이동
-                if (aiState.path.length === 0 || 
-                    aiState.path[aiState.path.length - 1].x !== aiState.targetPosition.x ||
-                    aiState.path[aiState.path.length - 1].y !== aiState.targetPosition.y) {
-                    aiState.path = [
-                        { x: aiState.position.x, y: aiState.position.y },
-                        { x: aiState.targetPosition.x, y: aiState.targetPosition.y }
-                    ];
-                    aiState.currentPathIndex = 1;
-                }
-            } else {
-                updateAIPath();
-            }
+            updateAIPath();
         }
     } else {
         // 목표 방향으로 이동 (방 경계 체크 포함)
@@ -920,27 +1017,38 @@ function updateAIMovement() {
         const moveDiffZ = Math.abs(actualMoveZ - expectedMoveZ);
         const moveThreshold = 0.01; // 작은 차이는 무시
         
-        // 경계에 낑겼고 목표 방향으로 이동할 수 없으면 경로 재계산
-        if ((moveDiffX > moveThreshold || moveDiffZ > moveThreshold) && 
-            (Math.abs(moveX) > 0.001 || Math.abs(moveZ) > 0.001)) {
+        // 경계에 낑겼는지 확인 (더 엄격한 조건)
+        const isStuck = (moveDiffX > moveThreshold || moveDiffZ > moveThreshold) && 
+                        (Math.abs(moveX) > 0.001 || Math.abs(moveZ) > 0.001);
+        
+        if (isStuck) {
             // 목표 방향으로 이동할 수 없으므로 경로 재계산
             const targetDirX = Math.sign(distX);
             const targetDirZ = Math.sign(distZ);
-            const blockedX = Math.abs(actualMoveX) < Math.abs(expectedMoveX) * 0.5 && Math.abs(moveX) > 0.001;
-            const blockedZ = Math.abs(actualMoveZ) < Math.abs(expectedMoveZ) * 0.5 && Math.abs(moveZ) > 0.001;
+            const blockedX = Math.abs(actualMoveX) < Math.abs(expectedMoveX) * 0.3 && Math.abs(moveX) > 0.001;
+            const blockedZ = Math.abs(actualMoveZ) < Math.abs(expectedMoveZ) * 0.3 && Math.abs(moveZ) > 0.001;
             
-            // 경계에 막혔고 목표 방향으로 이동할 수 없으면 경로 재탐색
+            // 경계에 막혔고 목표 방향으로 이동할 수 없으면 낑김 카운트 증가
             if ((blockedX && targetDirX !== 0) || (blockedZ && targetDirZ !== 0)) {
-                // 경로 재탐색 (1초마다만)
-                if (now - lastMovementUpdate >= 1000) {
-                    console.log('AI 경계에 낑김, 경로 재탐색');
+                aiState.stuckFrames++;
+                
+                // 연속으로 20프레임 이상 낑겼을 때만 경로 재탐색 (너무 자주 재탐색 방지)
+                if (aiState.stuckFrames >= 20) {
+                    console.log('AI 경계에 낑김 (연속 ' + aiState.stuckFrames + '프레임), 경로 재탐색');
                     aiState.path = [];
                     aiState.currentPathIndex = 0;
+                    aiState.stuckFrames = 0; // 리셋
                     updateAIPath();
                     lastMovementUpdate = now;
                     return;
                 }
+            } else {
+                // 낑긴 게 아니면 카운트 리셋
+                aiState.stuckFrames = 0;
             }
+        } else {
+            // 정상 이동 중이면 카운트 리셋
+            aiState.stuckFrames = 0;
         }
         
         aiState.mesh.position.x = newX;
@@ -972,47 +1080,43 @@ function updateAIMovement() {
                 }
                 
                 if (inDoorRange && (aiState.position.x !== currentTarget.x || aiState.position.y !== currentTarget.y)) {
+                    // 방 전환: 새로운 방에 들어감
                     aiState.position = { x: currentTarget.x, y: currentTarget.y };
                     aiState.currentPathIndex++;
                     
-                    // 경유점 도달 확인
-                    if (!aiState.reachedWaypoint && 
-                        aiState.position.x === aiState.waypoint.x && 
-                        aiState.position.y === aiState.waypoint.y) {
-                        aiState.reachedWaypoint = true;
-                        console.log('AI가 경유점에 도달했습니다!');
-                        aiState.path = [];
-                        aiState.currentPathIndex = 0;
-                        updateAIPath();
-                        return;
-                    }
-                    
-                    // 목표 도달 확인 (목표 방에 도달했는지 확인)
+                    // 목표 그리드에 도달했는지 확인
                     if (aiState.position.x === aiState.targetPosition.x && 
                         aiState.position.y === aiState.targetPosition.y) {
-                        aiState.reached = true;
-                        console.log('AI가 목표에 도달했습니다!');
+                        // 목표 그리드에 도달했으면 체크포인트 위치로 직접 이동
+                        const gameState = window.gameState;
+                        if (gameState && gameState.aiCheckpoint) {
+                            const checkpointPos = gameState.aiCheckpoint.position;
+                            const currentWorldX = aiState.mesh.position.x;
+                            const currentWorldZ = aiState.mesh.position.z;
+                            const targetWorldX = checkpointPos.x;
+                            const targetWorldZ = checkpointPos.z;
+                            
+                            const distX = targetWorldX - currentWorldX;
+                            const distZ = targetWorldZ - currentWorldZ;
+                            const distance = Math.sqrt(distX * distX + distZ * distZ);
+                            
+                            if (distance > 0.1) {
+                                // 체크포인트 방향으로 이동
+                                const moveX = (distX / distance) * aiState.speed;
+                                const moveZ = (distZ / distance) * aiState.speed;
+                                aiState.mesh.position.x += moveX;
+                                aiState.mesh.position.z += moveZ;
+                            }
+                        }
+                        // 경로는 비워서 더 이상 경로 탐색하지 않음
+                        aiState.path = [];
+                        aiState.currentPathIndex = 0;
                         return;
                     }
                     
-                    // 목표 방에 매우 가까우면 경로 재탐색하지 않음 (정신 못 차리는 것 방지)
-                    const distToTarget = Math.abs(aiState.position.x - aiState.targetPosition.x) + 
-                                       Math.abs(aiState.position.y - aiState.targetPosition.y);
-                    
-                    // 다음 경로 업데이트 (목표에서 2칸 이상 떨어져 있을 때만)
-                    if (aiState.currentPathIndex >= aiState.path.length && distToTarget > 2) {
+                    // 다음 경로 업데이트
+                    if (aiState.currentPathIndex >= aiState.path.length) {
                         updateAIPath();
-                    } else if (aiState.currentPathIndex >= aiState.path.length && distToTarget <= 2) {
-                        // 목표에 가까우면 직접 목표로 이동
-                        if (aiState.path.length === 0 || 
-                            aiState.path[aiState.path.length - 1].x !== aiState.targetPosition.x ||
-                            aiState.path[aiState.path.length - 1].y !== aiState.targetPosition.y) {
-                            aiState.path = [
-                                { x: aiState.position.x, y: aiState.position.y },
-                                { x: aiState.targetPosition.x, y: aiState.targetPosition.y }
-                            ];
-                            aiState.currentPathIndex = 1;
-                        }
                     }
                 }
             }
@@ -1059,10 +1163,23 @@ function initAI() {
     aiState.lastPathCheckTime = Date.now();
     aiState.checkingPath = false;
     
+    // 체크포인트를 목표로 설정
+    if (gameState.aiCheckpoint) {
+        aiState.targetPosition = { 
+            x: gameState.aiCheckpoint.gridX, 
+            y: gameState.aiCheckpoint.gridY 
+        };
+        console.log('AI 목표 설정 (체크포인트):', aiState.targetPosition);
+    } else {
+        // 체크포인트가 없으면 기본값 사용
+        aiState.targetPosition = { x: 0, y: 4 };
+        console.log('AI 목표 설정 (기본값):', aiState.targetPosition);
+    }
+    
     // AI 상태를 window에 노출 (미니맵 표시를 위해)
     window.aiState = aiState;
     
-    console.log('AI 초기화 완료, 위치:', aiState.position);
+    console.log('AI 초기화 완료, 위치:', aiState.position, '목표:', aiState.targetPosition);
     
     // 경로 탐색 시작
     setTimeout(() => {
@@ -1075,162 +1192,6 @@ window.initAI = initAI;
 window.updateAI = updateAI;
 window.damageAI = damageAI;
 
-// AI 총알 발사
-function shootAIBullet() {
-    if (!aiState.canShoot || !aiState.mesh) return;
-    
-    const camera = window.camera;
-    if (!camera) return;
-    
-    // 플레이어 위치
-    const playerPos = new THREE.Vector3();
-    camera.getWorldPosition(playerPos);
-    
-    // AI 위치
-    const aiPos = aiState.mesh.position;
-    
-    // 방향 계산
-    const direction = new THREE.Vector3();
-    direction.subVectors(playerPos, aiPos).normalize();
-    
-    // 총알 시작 위치 (AI 앞)
-    const startPos = aiPos.clone();
-    startPos.add(direction.clone().multiplyScalar(0.5));
-    startPos.y = 1.0; // 플레이어 눈 높이
-    
-    // 총알 생성 (느린 총알)
-    const bulletGeometry = new THREE.SphereGeometry(0.1, 8, 8);
-    const bulletMaterial = new THREE.MeshStandardMaterial({ 
-        color: 0xff0000,
-        emissive: 0xff0000,
-        emissiveIntensity: 0.8
-    });
-    const bullet = new THREE.Mesh(bulletGeometry, bulletMaterial);
-    bullet.position.copy(startPos);
-    
-    const scene = window.scene;
-    if (scene) {
-        scene.add(bullet);
-    }
-    
-    // 총알 정보 저장
-    const bulletData = {
-        mesh: bullet,
-        direction: direction.clone(),
-        position: startPos.clone(),
-        speed: 0.15, // 느린 속도
-        damage: 30,
-        lifetime: 0,
-        maxLifetime: 5.0 // 5초 후 자동 제거
-    };
-    
-    aiBullets.push(bulletData);
-    
-    aiState.canShoot = false;
-    aiState.shootCooldown = 2.0; // 2초 쿨다운
-    aiState.lastShootTime = Date.now();
-}
-
-// AI 총알 업데이트
-let lastAIBulletUpdateTime = performance.now();
-
-function updateAIBullets() {
-    const camera = window.camera;
-    if (!camera) return;
-    
-    const currentTime = performance.now();
-    const deltaTime = Math.min((currentTime - lastAIBulletUpdateTime) / 1000, 0.1);
-    lastAIBulletUpdateTime = currentTime;
-    
-    for (let i = aiBullets.length - 1; i >= 0; i--) {
-        const bullet = aiBullets[i];
-        bullet.lifetime += deltaTime;
-        
-        // 수명 초과 시 제거
-        if (bullet.lifetime >= bullet.maxLifetime) {
-            const scene = window.scene;
-            if (scene) {
-                scene.remove(bullet.mesh);
-            }
-            bullet.mesh.geometry.dispose();
-            bullet.mesh.material.dispose();
-            aiBullets.splice(i, 1);
-            continue;
-        }
-        
-        // 이동
-        const moveVector = bullet.direction.clone().multiplyScalar(bullet.speed);
-        bullet.position.add(moveVector);
-        bullet.mesh.position.copy(bullet.position);
-        
-        // 플레이어와 충돌 체크
-        if (camera) {
-            const playerPos = new THREE.Vector3();
-            camera.getWorldPosition(playerPos);
-            const distance = bullet.position.distanceTo(playerPos);
-            
-            if (distance < 0.3) { // 충돌 감지
-                // 플레이어에게 데미지
-                if (window.damagePlayer) {
-                    window.damagePlayer(bullet.damage);
-                }
-                
-                // 총알 제거
-                const scene = window.scene;
-                if (scene) {
-                    scene.remove(bullet.mesh);
-                }
-                bullet.mesh.geometry.dispose();
-                bullet.mesh.material.dispose();
-                aiBullets.splice(i, 1);
-            }
-        }
-    }
-    
-    // 쿨다운 업데이트
-    if (aiState.shootCooldown > 0) {
-        aiState.shootCooldown -= deltaTime;
-        if (aiState.shootCooldown <= 0) {
-            aiState.canShoot = true;
-        }
-    }
-}
-
-// AI 플레이어 감지 및 공격
-function checkPlayerAndShoot() {
-    if (!aiState.mesh || aiState.reached || !aiState.canShoot) return;
-    
-    const camera = window.camera;
-    if (!camera) return;
-    
-    // 플레이어와 AI가 같은 방에 있는지 확인
-    const gameState = window.gameState;
-    if (!gameState || !gameState.currentRoom) return;
-    
-    const playerRoom = gameState.currentRoom;
-    const aiGridX = aiState.position.x;
-    const aiGridY = aiState.position.y;
-    
-    // 같은 방에 있지 않으면 발사하지 않음
-    if (playerRoom.gridX !== aiGridX || playerRoom.gridY !== aiGridY) {
-        return;
-    }
-    
-    // 플레이어 위치
-    const playerPos = new THREE.Vector3();
-    camera.getWorldPosition(playerPos);
-    
-    // AI 위치
-    const aiPos = aiState.mesh.position;
-    
-    // 거리 계산
-    const distance = playerPos.distanceTo(aiPos);
-    
-    // 감지 범위 내에 있으면 발사
-    if (distance <= aiState.detectionRange) {
-        shootAIBullet();
-    }
-}
 
 // AI 데미지 처리
 function damageAI(damage) {
@@ -1258,28 +1219,18 @@ function damageAI(damage) {
 
 // AI 업데이트 (애니메이션 루프에서 호출)
 let lastAIPathUpdate = 0;
-let lastAIShootCheck = 0;
 
 function updateAI() {
     if (!aiState.mesh) return;
     
     const now = Date.now();
     
-    // 경로 업데이트는 1초마다만 체크 (updateAIPath 내부에서도 시간 체크하지만, 여기서도 제한)
-    if (now - lastAIPathUpdate >= 1000) {
+    // 경로 업데이트는 updateAIMovement 내부에서 필요할 때만 호출
+    // 여기서는 주기적으로만 체크 (3초마다)
+    if (now - aiState.lastPathCheckTime >= 3000) {
         updateAIPath();
-        lastAIPathUpdate = now;
     }
     
     updateAIMovement();
-    
-    // AI 총알 업데이트
-    updateAIBullets();
-    
-    // 플레이어 감지 및 공격은 0.1초마다만 체크 (너무 자주 호출하지 않음)
-    if (now - lastAIShootCheck >= 100) {
-        checkPlayerAndShoot();
-        lastAIShootCheck = now;
-    }
 }
 

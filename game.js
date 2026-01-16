@@ -1328,7 +1328,8 @@ function drawMapToCanvas(canvas, initialCellSize, padding, showLabels) {
     }
     
     // AI 위치 표시 (ai.js가 로드되었고 AI가 존재하면)
-    if (typeof window.aiState !== 'undefined' && window.aiState && window.aiState.mesh && !window.aiState.reached) {
+    // reached 플래그와 관계없이 항상 표시 (목표 그리드 도달 후에도 체크포인트로 이동 중일 수 있음)
+    if (typeof window.aiState !== 'undefined' && window.aiState && window.aiState.mesh) {
         const aiPos = window.aiState.position;
         const aiMesh = window.aiState.mesh;
         
