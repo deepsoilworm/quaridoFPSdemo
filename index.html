@@ -186,6 +186,48 @@
             background: #555;
             cursor: not-allowed;
         }
+        
+        #victory {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0, 0, 0, 0.95);
+            padding: 40px;
+            border-radius: 15px;
+            border: 3px solid #ffd700;
+            z-index: 400;
+            display: none;
+            color: white;
+            text-align: center;
+            min-width: 400px;
+        }
+        
+        #victory h2 {
+            color: #ffd700;
+            font-size: 36px;
+            margin-bottom: 20px;
+        }
+        
+        #victory p {
+            font-size: 18px;
+            margin-bottom: 30px;
+        }
+        
+        #victory button {
+            padding: 15px 30px;
+            background: #4a9a4a;
+            border: none;
+            border-radius: 5px;
+            color: white;
+            font-size: 18px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        #victory button:hover {
+            background: #5aaa5a;
+        }
     </style>
 </head>
 <body>
@@ -207,6 +249,11 @@
         <div id="mapOverlay">
             <canvas id="mapCanvas"></canvas>
         </div>
+        <div id="victory">
+            <h2>🎉 승리! 🎉</h2>
+            <p>최북단에 도달했습니다!</p>
+            <button onclick="location.reload()">다시 시작</button>
+        </div>
     </div>
     
     <script type="importmap">
@@ -219,6 +266,7 @@
     </script>
     
     <script type="module" src="game.js"></script>
+    <script type="module" src="ai.js"></script>
 </body>
 </html>
 

@@ -14,6 +14,19 @@ const gameState = {
     doorPassageCheck: null // 문 통과 체크용
 };
 
+// 플레이어 상태
+const playerState = {
+    health: 100,
+    maxHealth: 100,
+    ammo: 30,
+    maxAmmo: 30,
+    canShoot: true,
+    shootCooldown: 0
+};
+
+// 플레이어 총알 배열
+const playerBullets = [];
+
 // 7가지 방 타입 정의 (상대적 방향: 0=입구, 1=왼쪽, 2=뒤, 3=오른쪽)
 const RoomTypes = {
     // 통로형 (3가지) - 입구(0) + 다른 방향 하나
@@ -128,6 +141,14 @@ document.addEventListener('keydown', (e) => {
             }
         }
     }
+    
+    // 마우스 클릭으로 발사 (왼쪽 클릭)
+    if (keyCode === 'Space' || e.key === ' ') {
+        e.preventDefault();
+        if (!gameState.mapMode && controls.isLocked && playerState.canShoot && playerState.ammo > 0) {
+            shootPlayerBullet();
+        }
+    }
 }, true); // capture phase에서도 처리
 
 document.addEventListener('keyup', (e) => {
@@ -143,10 +164,14 @@ document.addEventListener('keyup', (e) => {
     }
 }, true); // capture phase에서도 처리
 
-// 마우스 클릭으로 포인터 잠금
-renderer.domElement.addEventListener('click', () => {
+// 마우스 클릭으로 포인터 잠금 및 발사
+renderer.domElement.addEventListener('click', (e) => {
     if (!gameState.mapMode) {
-        controls.lock();
+        if (controls.isLocked && playerState.canShoot && playerState.ammo > 0) {
+            shootPlayerBullet();
+        } else {
+            controls.lock();
+        }
     }
 });
 
@@ -812,6 +837,20 @@ function moveToRoom(gridX, gridY) {
     
     // doorPassageCheck 초기화
     gameState.doorPassageCheck = null;
+    
+    // 승리 조건 체크: 최북단 가운데 방(x=0, y=-4)에 도달했는지 확인
+    if (gridX === 0 && gridY === -4) {
+        showVictory();
+    }
+}
+
+// 승리 UI 표시
+function showVictory() {
+    const victoryDiv = document.getElementById('victory');
+    if (victoryDiv) {
+        victoryDiv.style.display = 'flex';
+        controls.unlock();
+    }
 }
 
 // 문 감지
@@ -1058,6 +1097,69 @@ function drawMapToCanvas(canvas, initialCellSize, padding, showLabels) {
         );
         ctx.stroke();
     }
+    
+    // AI 위치 표시 (ai.js가 로드되었고 AI가 존재하면)
+    if (typeof window.aiState !== 'undefined' && window.aiState && window.aiState.mesh && !window.aiState.reached) {
+        const aiPos = window.aiState.position;
+        const aiMesh = window.aiState.mesh;
+        
+        if (aiPos) {
+            // AI의 그리드 위치
+            const aiGridX = aiPos.x;
+            const aiGridY = aiPos.y;
+            
+            // AI가 현재 표시 범위 내에 있는지 확인
+            if (aiGridX >= minX && aiGridX <= maxX && aiGridY >= minY && aiGridY <= maxY) {
+                // AI 방의 네모 위치 계산
+                const aiRoomMapX = (aiGridX - minX) * cellSize + padding;
+                const aiRoomMapY = (aiGridY - minY) * cellSize + padding;
+                
+                // AI의 실제 월드 위치를 방 안에서의 상대적 위치로 변환
+                const aiRoomCenterX = aiGridX * ROOM_SIZE;
+                const aiRoomCenterZ = aiGridY * ROOM_SIZE;
+                const relativeAIX = (aiMesh.position.x - aiRoomCenterX) / ROOM_SIZE;
+                const relativeAIZ = (aiMesh.position.z - aiRoomCenterZ) / ROOM_SIZE;
+                
+                // AI 위치를 방 네모 안에 상대적으로 표시
+                const aiMapX = aiRoomMapX + cellSize / 2 + relativeAIX * cellSize;
+                const aiMapY = aiRoomMapY + cellSize / 2 + relativeAIZ * cellSize;
+                
+                // AI가 그리드 범위 내에 있는지 확인
+                if (aiMapX >= padding && aiMapX < canvas.width - padding && 
+                    aiMapY >= padding && aiMapY < canvas.height - padding) {
+                    // 파란색 원으로 AI 위치 표시 (플레이어와 구분)
+                    ctx.fillStyle = '#0000ff';
+                    ctx.beginPath();
+                    ctx.arc(aiMapX, aiMapY, showLabels ? 4 : 2, 0, Math.PI * 2);
+                    ctx.fill();
+                    
+                    // AI 이동 방향 표시 (다음 경로 지점으로)
+                    if (window.aiState.path && window.aiState.path.length > window.aiState.currentPathIndex) {
+                        const nextTarget = window.aiState.path[window.aiState.currentPathIndex];
+                        const targetWorldX = nextTarget.x * ROOM_SIZE;
+                        const targetWorldZ = nextTarget.y * ROOM_SIZE;
+                        const dirX = (targetWorldX - aiMesh.position.x);
+                        const dirZ = (targetWorldZ - aiMesh.position.z);
+                        const distance = Math.sqrt(dirX * dirX + dirZ * dirZ);
+                        
+                        if (distance > 0.1) {
+                            const angle = Math.atan2(dirX, dirZ);
+                            
+                            ctx.strokeStyle = '#0000ff';
+                            ctx.lineWidth = 2;
+                            ctx.beginPath();
+                            ctx.moveTo(aiMapX, aiMapY);
+                            ctx.lineTo(
+                                aiMapX + Math.sin(angle) * (cellSize / 4),
+                                aiMapY + Math.cos(angle) * (cellSize / 4)
+                            );
+                            ctx.stroke();
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // 이동 처리
@@ -1284,6 +1386,134 @@ function updateDoorDetection() {
     }
 }
 
+// 플레이어 총알 발사
+function shootPlayerBullet() {
+    if (playerState.ammo <= 0 || !playerState.canShoot) return;
+    
+    playerState.ammo--;
+    playerState.canShoot = false;
+    playerState.shootCooldown = 0.2; // 0.2초 쿨다운
+    
+    // 카메라 방향으로 빔 생성
+    const direction = new THREE.Vector3();
+    camera.getWorldDirection(direction);
+    
+    // 빔 시작 위치 (카메라 앞)
+    const startPos = new THREE.Vector3();
+    camera.getWorldPosition(startPos);
+    startPos.add(direction.clone().multiplyScalar(0.5));
+    
+    // 빔 생성 (긴 원기둥 형태)
+    const beamGeometry = new THREE.CylinderGeometry(0.05, 0.05, 2, 8);
+    const beamMaterial = new THREE.MeshStandardMaterial({ 
+        color: 0x00ffff,
+        emissive: 0x00ffff,
+        emissiveIntensity: 1.0
+    });
+    const beam = new THREE.Mesh(beamGeometry, beamMaterial);
+    beam.position.copy(startPos);
+    
+    // 빔을 카메라 방향으로 회전
+    beam.lookAt(startPos.clone().add(direction));
+    beam.rotateX(Math.PI / 2); // 원기둥이 세로로 서있으므로 회전
+    
+    scene.add(beam);
+    
+    // 총알 정보 저장
+    const bullet = {
+        mesh: beam,
+        direction: direction.clone(),
+        position: startPos.clone(),
+        speed: 0.5,
+        damage: 30,
+        lifetime: 0,
+        maxLifetime: 3.0 // 3초 후 자동 제거
+    };
+    
+    playerBullets.push(bullet);
+    updateUI();
+}
+
+// 플레이어 총알 업데이트
+let lastBulletUpdateTime = performance.now();
+
+function updatePlayerBullets() {
+    const currentTime = performance.now();
+    const deltaTime = Math.min((currentTime - lastBulletUpdateTime) / 1000, 0.1);
+    lastBulletUpdateTime = currentTime;
+    
+    for (let i = playerBullets.length - 1; i >= 0; i--) {
+        const bullet = playerBullets[i];
+        bullet.lifetime += deltaTime;
+        
+        // 수명 초과 시 제거
+        if (bullet.lifetime >= bullet.maxLifetime) {
+            scene.remove(bullet.mesh);
+            bullet.mesh.geometry.dispose();
+            bullet.mesh.material.dispose();
+            playerBullets.splice(i, 1);
+            continue;
+        }
+        
+        // 이동
+        const moveVector = bullet.direction.clone().multiplyScalar(bullet.speed);
+        bullet.position.add(moveVector);
+        bullet.mesh.position.copy(bullet.position);
+        
+        // AI와 충돌 체크 (AI가 존재하고 사망하지 않았을 때만)
+        if (window.aiState && window.aiState.mesh && window.aiState.health > 0) {
+            const aiPos = window.aiState.mesh.position;
+            const distance = bullet.position.distanceTo(aiPos);
+            
+            if (distance < 0.5) { // 충돌 감지
+                // AI에게 데미지
+                if (window.damageAI) {
+                    window.damageAI(bullet.damage);
+                }
+                
+                // 총알 제거
+                scene.remove(bullet.mesh);
+                bullet.mesh.geometry.dispose();
+                bullet.mesh.material.dispose();
+                playerBullets.splice(i, 1);
+            }
+        }
+    }
+    
+    // 쿨다운 업데이트
+    if (playerState.shootCooldown > 0) {
+        playerState.shootCooldown -= deltaTime;
+        if (playerState.shootCooldown <= 0) {
+            playerState.canShoot = true;
+        }
+    }
+}
+
+// 플레이어 데미지 처리
+function damagePlayer(damage) {
+    playerState.health -= damage;
+    if (playerState.health < 0) {
+        playerState.health = 0;
+        // 게임 오버 처리 (선택사항)
+    }
+    updateUI();
+}
+
+// UI 업데이트
+function updateUI() {
+    const ui = document.getElementById('ui');
+    if (ui) {
+        ui.innerHTML = `
+            <div>WASD: 이동 | 마우스: 시야 조절</div>
+            <div>E: 새 방 생성 (방 종류 선택)</div>
+            <div>E: 맵 보기 (문 근처가 아닐 때)</div>
+            <div>ESC: 맵 닫기</div>
+            <div style="margin-top: 10px; color: #ff0000;">체력: ${playerState.health}/${playerState.maxHealth}</div>
+            <div style="color: #00ffff;">탄약: ${playerState.ammo}/${playerState.maxAmmo}</div>
+        `;
+    }
+}
+
 // 문 통과 체크 (열린 문은 E키 없이 자동으로 통과 가능)
 function checkDoorPassage(door) {
     const doorDirection = door.userData.direction;
@@ -1324,13 +1554,34 @@ function checkDoorPassage(door) {
 }
 
 // 애니메이션 루프
+let lastFrameTime = performance.now();
+
 function animate() {
     requestAnimationFrame(animate);
+    
+    const currentTime = performance.now();
+    const deltaTime = Math.min((currentTime - lastFrameTime) / 1000, 0.1); // 최대 0.1초로 제한 (프레임 드롭 방지)
+    lastFrameTime = currentTime;
     
     if (!gameState.mapMode) {
         handleMovement();
         updateDoorDetection();
-        drawMinimap(); // 미니맵 업데이트
+        
+        // 미니맵을 매 프레임마다 그리지 않고 일정 시간마다만 업데이트 (성능 최적화)
+        const now = Date.now();
+        if (!window.lastMinimapUpdate) window.lastMinimapUpdate = 0;
+        const MINIMAP_UPDATE_INTERVAL = 100; // 100ms마다 업데이트 (10fps)
+        if (now - window.lastMinimapUpdate >= MINIMAP_UPDATE_INTERVAL) {
+            drawMinimap();
+            window.lastMinimapUpdate = now;
+        }
+        
+        updatePlayerBullets(); // 플레이어 총알 업데이트
+    }
+    
+    // AI 업데이트 (ai.js가 로드되었으면)
+    if (typeof window.updateAI === 'function') {
+        window.updateAI();
     }
     
     renderer.render(scene, camera);
@@ -1339,6 +1590,31 @@ function animate() {
 // 초기화
 createStartRoom();
 drawMinimap(); // 초기 미니맵 그리기
+updateUI(); // 초기 UI 업데이트
+
+// AI에서 사용할 함수들과 변수를 전역에 노출
+window.getTargetGrid = getTargetGrid;
+window.ROOM_SIZE = ROOM_SIZE;
+window.gameState = gameState;
+window.scene = scene;
+window.createRoom = createRoom;
+window.relativeToAbsolute = relativeToAbsolute;
+window.selectThreeRoomTypes = selectThreeRoomTypes;
+window.drawMinimap = drawMinimap;
+window.removeDoorCompletely = removeDoorCompletely;
+window.camera = camera;
+window.damagePlayer = damagePlayer;
+window.playerState = playerState;
+
+// AI 초기화 (ai.js가 로드되었으면)
+setTimeout(() => {
+    console.log('AI 초기화 시도, initAI:', typeof window.initAI);
+    if (typeof window.initAI === 'function') {
+        window.initAI();
+    } else {
+        console.error('AI 초기화 함수를 찾을 수 없습니다.');
+    }
+}, 1000); // 게임 초기화 후 약간의 지연 후 AI 초기화
 // 목표 방 미리 생성 (임시로 (3, 0)에)
 // 실제로는 플레이어가 도달할 때 생성되도록 할 수도 있음
 
