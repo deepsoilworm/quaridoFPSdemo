@@ -479,9 +479,16 @@ function updateAIPath() {
     
     const now = Date.now();
     const timeSinceLastCheck = now - aiState.lastPathCheckTime;
+    
+    // 목표 방에 가까운지 확인 (2칸 이내)
+    const distToTarget = Math.abs(aiState.position.x - aiState.targetPosition.x) + 
+                         Math.abs(aiState.position.y - aiState.targetPosition.y);
+    const isNearTarget = distToTarget <= 2;
+    
+    // 목표에 가까우면 경로 재탐색 빈도 줄이기 (정신 못 차리는 것 방지)
     const shouldCheck = aiState.path.length === 0 || 
                         aiState.currentPathIndex >= aiState.path.length ||
-                        timeSinceLastCheck >= 20000; // 20초마다
+                        (isNearTarget ? timeSinceLastCheck >= 5000 : timeSinceLastCheck >= 20000); // 가까우면 5초, 멀면 20초
     
     if (shouldCheck) {
         aiState.checkingPath = true;
@@ -812,15 +819,204 @@ function updateAIMovement() {
         }
         
         // 다음 경로를 위해 업데이트
+        // 목표에 가까우면 경로 재탐색하지 않고 직접 목표로 이동
+        const distToTarget = Math.abs(aiState.position.x - aiState.targetPosition.x) + 
+                           Math.abs(aiState.position.y - aiState.targetPosition.y);
+        
         if (aiState.currentPathIndex >= aiState.path.length) {
-            updateAIPath();
+            if (distToTarget <= 2) {
+                // 목표에 가까우면 직접 목표로 이동
+                if (aiState.path.length === 0 || 
+                    aiState.path[aiState.path.length - 1].x !== aiState.targetPosition.x ||
+                    aiState.path[aiState.path.length - 1].y !== aiState.targetPosition.y) {
+                    aiState.path = [
+                        { x: aiState.position.x, y: aiState.position.y },
+                        { x: aiState.targetPosition.x, y: aiState.targetPosition.y }
+                    ];
+                    aiState.currentPathIndex = 1;
+                }
+            } else {
+                updateAIPath();
+            }
         }
     } else {
-        // 목표 방향으로 이동
+        // 목표 방향으로 이동 (방 경계 체크 포함)
         const moveX = (distX / distance) * aiState.speed;
         const moveZ = (distZ / distance) * aiState.speed;
-        aiState.mesh.position.x += moveX;
-        aiState.mesh.position.z += moveZ;
+        
+        // 방 경계 체크
+        const ROOM_SIZE = window.ROOM_SIZE || 8;
+        const DOOR_WIDTH = 1.5;
+        const roomCenterX = aiState.position.x * ROOM_SIZE;
+        const roomCenterZ = aiState.position.y * ROOM_SIZE;
+        const halfSize = ROOM_SIZE / 2 - 0.5;
+        
+        // 기본 경계
+        let xMin = roomCenterX - halfSize;
+        let xMax = roomCenterX + halfSize;
+        let zMin = roomCenterZ - halfSize;
+        let zMax = roomCenterZ + halfSize;
+        
+        // 열린 문 방향 확인
+        const doorHalfWidth = DOOR_WIDTH / 2;
+        const gameState = window.gameState;
+        const getTargetGridFunc = window.getTargetGrid;
+        
+        if (currentRoom && currentRoom.doors && getTargetGridFunc) {
+            currentRoom.doors.forEach((doorDir) => {
+                const doorKey = `${currentRoom.gridX},${currentRoom.gridY},${doorDir}`;
+                const targetGrid = getTargetGridFunc(currentRoom.gridX, currentRoom.gridY, doorDir);
+                const targetRoom = gameState?.rooms.get(`${targetGrid.x},${targetGrid.y}`);
+                
+                // 문이 열려있는지 확인
+                const isOpen = gameState?.openedDoors?.has(doorKey) || 
+                              (targetRoom && targetRoom.generated && 
+                               gameState?.openedDoors?.has(`${targetGrid.x},${targetGrid.y},${(doorDir + 2) % 4}`));
+                
+                if (isOpen && targetRoom && targetRoom.generated) {
+                    const margin = 2.0;
+                    
+                    if (doorDir === 0) { // 북
+                        const doorXMin = roomCenterX - doorHalfWidth;
+                        const doorXMax = roomCenterX + doorHalfWidth;
+                        if (aiState.mesh.position.x >= doorXMin && aiState.mesh.position.x <= doorXMax) {
+                            zMin = Math.min(zMin, roomCenterZ - halfSize - margin);
+                        }
+                    } else if (doorDir === 1) { // 동
+                        const doorZMin = roomCenterZ - doorHalfWidth;
+                        const doorZMax = roomCenterZ + doorHalfWidth;
+                        if (aiState.mesh.position.z >= doorZMin && aiState.mesh.position.z <= doorZMax) {
+                            xMax = Math.max(xMax, roomCenterX + halfSize + margin);
+                        }
+                    } else if (doorDir === 2) { // 남
+                        const doorXMin = roomCenterX - doorHalfWidth;
+                        const doorXMax = roomCenterX + doorHalfWidth;
+                        if (aiState.mesh.position.x >= doorXMin && aiState.mesh.position.x <= doorXMax) {
+                            zMax = Math.max(zMax, roomCenterZ + halfSize + margin);
+                        }
+                    } else if (doorDir === 3) { // 서
+                        const doorZMin = roomCenterZ - doorHalfWidth;
+                        const doorZMax = roomCenterZ + doorHalfWidth;
+                        if (aiState.mesh.position.z >= doorZMin && aiState.mesh.position.z <= doorZMax) {
+                            xMin = Math.min(xMin, roomCenterX - halfSize - margin);
+                        }
+                    }
+                }
+            });
+        }
+        
+        // 경계 제한 적용 (낑김 방지를 위해 약간의 여유 공간 추가)
+        const newX = Math.max(xMin, Math.min(xMax, aiState.mesh.position.x + moveX));
+        const newZ = Math.max(zMin, Math.min(zMax, aiState.mesh.position.z + moveZ));
+        
+        // 경계에 낑겼는지 확인 (이동하려는 방향과 실제 이동한 거리 비교)
+        const actualMoveX = newX - aiState.mesh.position.x;
+        const actualMoveZ = newZ - aiState.mesh.position.z;
+        const expectedMoveX = moveX;
+        const expectedMoveZ = moveZ;
+        
+        // 예상 이동과 실제 이동이 크게 다르면 경계에 낑긴 것
+        const moveDiffX = Math.abs(actualMoveX - expectedMoveX);
+        const moveDiffZ = Math.abs(actualMoveZ - expectedMoveZ);
+        const moveThreshold = 0.01; // 작은 차이는 무시
+        
+        // 경계에 낑겼고 목표 방향으로 이동할 수 없으면 경로 재계산
+        if ((moveDiffX > moveThreshold || moveDiffZ > moveThreshold) && 
+            (Math.abs(moveX) > 0.001 || Math.abs(moveZ) > 0.001)) {
+            // 목표 방향으로 이동할 수 없으므로 경로 재계산
+            const targetDirX = Math.sign(distX);
+            const targetDirZ = Math.sign(distZ);
+            const blockedX = Math.abs(actualMoveX) < Math.abs(expectedMoveX) * 0.5 && Math.abs(moveX) > 0.001;
+            const blockedZ = Math.abs(actualMoveZ) < Math.abs(expectedMoveZ) * 0.5 && Math.abs(moveZ) > 0.001;
+            
+            // 경계에 막혔고 목표 방향으로 이동할 수 없으면 경로 재탐색
+            if ((blockedX && targetDirX !== 0) || (blockedZ && targetDirZ !== 0)) {
+                // 경로 재탐색 (1초마다만)
+                if (now - lastMovementUpdate >= 1000) {
+                    console.log('AI 경계에 낑김, 경로 재탐색');
+                    aiState.path = [];
+                    aiState.currentPathIndex = 0;
+                    updateAIPath();
+                    lastMovementUpdate = now;
+                    return;
+                }
+            }
+        }
+        
+        aiState.mesh.position.x = newX;
+        aiState.mesh.position.z = newZ;
+        
+        // 방 경계를 넘었는지 확인하고 방 전환
+        const threshold = 0.5;
+        if (direction !== -1) {
+            let passed = false;
+            if (direction === 0) { // 북
+                passed = aiState.mesh.position.z <= roomCenterZ - halfSize + threshold;
+            } else if (direction === 1) { // 동
+                passed = aiState.mesh.position.x >= roomCenterX + halfSize - threshold;
+            } else if (direction === 2) { // 남
+                passed = aiState.mesh.position.z >= roomCenterZ + halfSize - threshold;
+            } else if (direction === 3) { // 서
+                passed = aiState.mesh.position.x <= roomCenterX - halfSize + threshold;
+            }
+            
+            if (passed && targetRoom && targetRoom.generated) {
+                // 문의 폭 범위 내에 있는지 확인
+                let inDoorRange = false;
+                if (direction === 0 || direction === 2) { // 북/남
+                    inDoorRange = aiState.mesh.position.x >= roomCenterX - doorHalfWidth && 
+                                 aiState.mesh.position.x <= roomCenterX + doorHalfWidth;
+                } else { // 동/서
+                    inDoorRange = aiState.mesh.position.z >= roomCenterZ - doorHalfWidth && 
+                                 aiState.mesh.position.z <= roomCenterZ + doorHalfWidth;
+                }
+                
+                if (inDoorRange && (aiState.position.x !== currentTarget.x || aiState.position.y !== currentTarget.y)) {
+                    aiState.position = { x: currentTarget.x, y: currentTarget.y };
+                    aiState.currentPathIndex++;
+                    
+                    // 경유점 도달 확인
+                    if (!aiState.reachedWaypoint && 
+                        aiState.position.x === aiState.waypoint.x && 
+                        aiState.position.y === aiState.waypoint.y) {
+                        aiState.reachedWaypoint = true;
+                        console.log('AI가 경유점에 도달했습니다!');
+                        aiState.path = [];
+                        aiState.currentPathIndex = 0;
+                        updateAIPath();
+                        return;
+                    }
+                    
+                    // 목표 도달 확인 (목표 방에 도달했는지 확인)
+                    if (aiState.position.x === aiState.targetPosition.x && 
+                        aiState.position.y === aiState.targetPosition.y) {
+                        aiState.reached = true;
+                        console.log('AI가 목표에 도달했습니다!');
+                        return;
+                    }
+                    
+                    // 목표 방에 매우 가까우면 경로 재탐색하지 않음 (정신 못 차리는 것 방지)
+                    const distToTarget = Math.abs(aiState.position.x - aiState.targetPosition.x) + 
+                                       Math.abs(aiState.position.y - aiState.targetPosition.y);
+                    
+                    // 다음 경로 업데이트 (목표에서 2칸 이상 떨어져 있을 때만)
+                    if (aiState.currentPathIndex >= aiState.path.length && distToTarget > 2) {
+                        updateAIPath();
+                    } else if (aiState.currentPathIndex >= aiState.path.length && distToTarget <= 2) {
+                        // 목표에 가까우면 직접 목표로 이동
+                        if (aiState.path.length === 0 || 
+                            aiState.path[aiState.path.length - 1].x !== aiState.targetPosition.x ||
+                            aiState.path[aiState.path.length - 1].y !== aiState.targetPosition.y) {
+                            aiState.path = [
+                                { x: aiState.position.x, y: aiState.position.y },
+                                { x: aiState.targetPosition.x, y: aiState.targetPosition.y }
+                            ];
+                            aiState.currentPathIndex = 1;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
