@@ -11,7 +11,10 @@ const gameState = {
     pendingDoor: null,
     selectedRoomOption: null,
     openedDoors: new Set(), // 열린 문들 (문자열 키로 저장: "gridX,gridY,direction")
-    doorPassageCheck: null // 문 통과 체크용
+    doorPassageCheck: null, // 문 통과 체크용
+    gameEnded: false, // 게임 종료 여부
+    playerCheckpoint: null, // 플레이어 목표 체크포인트 (최북단)
+    aiCheckpoint: null // AI 목표 체크포인트 (최남단)
 };
 
 // 플레이어 상태
@@ -106,8 +109,6 @@ document.addEventListener('keydown', (e) => {
             return;
         } else if (gameState.nearDoor) {
             openDoor(gameState.nearDoor);
-        } else {
-            openMap();
         }
         e.preventDefault();
         e.stopPropagation();
@@ -428,8 +429,7 @@ function createAllGridRooms() {
 
 // 시작 방 생성 (최남단 가운데: x=0, y=4)
 function createStartRoom() {
-    // 전체 그리드 방 미리 생성
-    createAllGridRooms();
+    // 빈 방을 미리 생성하지 않음 - 방이 실제로 생성될 때만 추가됨
     
     const startX = 0; // 가운데
     const startY = 4; // 최남단 (5x9 그리드에서)
@@ -668,6 +668,34 @@ function createSelectedRoom() {
             absoluteDoors.push(entranceAbsoluteDir);
         }
         
+        // 반대편 방의 문 상태를 확인하여 일치시키기 (메타 체크)
+        for (let dir = 0; dir < 4; dir++) {
+            const oppositeGrid = getTargetGrid(targetGrid.x, targetGrid.y, dir);
+            const oppositeKey = `${oppositeGrid.x},${oppositeGrid.y}`;
+            const oppositeRoom = gameState.rooms.get(oppositeKey);
+            
+            // 반대편 방이 존재하고 생성되어 있으면
+            if (oppositeRoom && oppositeRoom.generated) {
+                const oppositeDir = (dir + 2) % 4; // 반대 방향
+                
+                // 반대편 방에 해당 방향에 문이 있으면, 새 방에도 그 방향에 문이 있어야 함
+                if (oppositeRoom.doors.includes(oppositeDir)) {
+                    if (!absoluteDoors.includes(dir)) {
+                        absoluteDoors.push(dir);
+                        console.log(`메타 체크: 반대편 방에 문이 있어서 새 방에도 ${directionNames[dir]} 방향 문 추가`);
+                    }
+                } else {
+                    // 반대편 방에 문이 없으면, 새 방에도 그 방향에 문이 없어야 함
+                    const index = absoluteDoors.indexOf(dir);
+                    if (index !== -1 && dir !== entranceAbsoluteDir) {
+                        // 입구는 제외하고 제거
+                        absoluteDoors.splice(index, 1);
+                        console.log(`메타 체크: 반대편 방에 문이 없어서 새 방의 ${directionNames[dir]} 방향 문 제거`);
+                    }
+                }
+            }
+        }
+        
         const newRoom = createRoom(
             targetGrid.x, 
             targetGrid.y, 
@@ -827,6 +855,50 @@ function removeDoorCompletely(door) {
     }
 }
 
+// 체크포인트 생성
+function createCheckpoint(gridX, gridY, isPlayerCheckpoint) {
+    const checkpointGroup = new THREE.Group();
+    
+    // 체크포인트 위치 (방 중앙)
+    const worldX = gridX * ROOM_SIZE;
+    const worldZ = gridY * ROOM_SIZE;
+    
+    // 기둥 생성
+    const pillarGeometry = new THREE.CylinderGeometry(0.2, 0.2, 2, 16);
+    const pillarMaterial = new THREE.MeshStandardMaterial({ 
+        color: isPlayerCheckpoint ? 0x00ff00 : 0xff0000,
+        emissive: isPlayerCheckpoint ? 0x00ff00 : 0xff0000,
+        emissiveIntensity: 0.5
+    });
+    const pillar = new THREE.Mesh(pillarGeometry, pillarMaterial);
+    pillar.position.set(0, 1, 0);
+    checkpointGroup.add(pillar);
+    
+    // 빛나는 효과
+    const glowGeometry = new THREE.CylinderGeometry(0.3, 0.3, 0.1, 16);
+    const glowMaterial = new THREE.MeshStandardMaterial({ 
+        color: isPlayerCheckpoint ? 0x00ff00 : 0xff0000,
+        emissive: isPlayerCheckpoint ? 0x00ff00 : 0xff0000,
+        emissiveIntensity: 1.0,
+        transparent: true,
+        opacity: 0.8
+    });
+    const glow = new THREE.Mesh(glowGeometry, glowMaterial);
+    glow.position.set(0, 2, 0);
+    checkpointGroup.add(glow);
+    
+    checkpointGroup.position.set(worldX, 0, worldZ);
+    scene.add(checkpointGroup);
+    
+    return {
+        group: checkpointGroup,
+        position: { x: worldX, y: 0, z: worldZ },
+        gridX: gridX,
+        gridY: gridY,
+        isPlayerCheckpoint: isPlayerCheckpoint
+    };
+}
+
 // 방으로 이동 (걸어서 이동하므로 카메라 위치는 그대로 유지)
 function moveToRoom(gridX, gridY) {
     gameState.playerPosition = { x: gridX, y: gridY };
@@ -837,19 +909,84 @@ function moveToRoom(gridX, gridY) {
     
     // doorPassageCheck 초기화
     gameState.doorPassageCheck = null;
-    
-    // 승리 조건 체크: 최북단 가운데 방(x=0, y=-4)에 도달했는지 확인
-    if (gridX === 0 && gridY === -4) {
-        showVictory();
-    }
 }
 
 // 승리 UI 표시
-function showVictory() {
+function showVictory(reason) {
+    if (gameState.gameEnded) return;
+    gameState.gameEnded = true;
+    
     const victoryDiv = document.getElementById('victory');
     if (victoryDiv) {
+        const reasonText = document.getElementById('victoryReason');
+        if (reasonText) {
+            reasonText.textContent = reason || '최북단 체크포인트에 도달했습니다!';
+        }
         victoryDiv.style.display = 'flex';
         controls.unlock();
+    }
+}
+
+// 패배 UI 표시
+function showDefeat(reason) {
+    if (gameState.gameEnded) return;
+    gameState.gameEnded = true;
+    
+    const defeatDiv = document.getElementById('defeat');
+    if (defeatDiv) {
+        const reasonText = document.getElementById('defeatReason');
+        if (reasonText) {
+            reasonText.textContent = reason;
+        }
+        defeatDiv.style.display = 'flex';
+        controls.unlock();
+    }
+}
+
+// 게임 종료 체크 (플레이어/AI 체크포인트 도착 및 사망)
+function checkGameEnd() {
+    if (gameState.gameEnded) return;
+    
+    // 플레이어 체크포인트 도착 체크
+    if (gameState.playerCheckpoint) {
+        const playerPos = camera.position;
+        const checkpointPos = gameState.playerCheckpoint.position;
+        const distance = Math.sqrt(
+            Math.pow(playerPos.x - checkpointPos.x, 2) + 
+            Math.pow(playerPos.z - checkpointPos.z, 2)
+        );
+        
+        if (distance < 1.0) { // 체크포인트 반경 1m 내
+            showVictory('최북단 체크포인트에 도달했습니다!');
+            return;
+        }
+    }
+    
+    // AI 체크포인트 도착 체크
+    if (gameState.aiCheckpoint && window.aiState && window.aiState.mesh) {
+        const aiPos = window.aiState.mesh.position;
+        const checkpointPos = gameState.aiCheckpoint.position;
+        const distance = Math.sqrt(
+            Math.pow(aiPos.x - checkpointPos.x, 2) + 
+            Math.pow(aiPos.z - checkpointPos.z, 2)
+        );
+        
+        if (distance < 1.0) { // 체크포인트 반경 1m 내
+            showDefeat('AI가 최남단 체크포인트에 도착했습니다!');
+            return;
+        }
+    }
+    
+    // 플레이어 사망 체크
+    if (playerState.health <= 0) {
+        showDefeat('플레이어가 사망했습니다!');
+        return;
+    }
+    
+    // AI 사망 체크 (승리 조건)
+    if (window.aiState && window.aiState.health <= 0) {
+        showVictory('AI를 처치했습니다!');
+        return;
     }
 }
 
@@ -864,6 +1001,7 @@ function checkNearDoor() {
     let nearestDoor = null;
     let minDistance = Infinity;
     
+    // 현재 방의 문 찾기
     roomGroup.traverse((child) => {
         if (child.userData.isDoor) {
             const doorWorldPos = new THREE.Vector3();
@@ -876,6 +1014,74 @@ function checkNearDoor() {
             }
         }
     });
+    
+    // 반대편 방의 문도 찾기 (현재 방에 문이 없어도 반대편 방에 문이 있으면 열 수 있도록)
+    const currentGridX = gameState.currentRoom.gridX;
+    const currentGridY = gameState.currentRoom.gridY;
+    
+    // 4방향 모두 확인
+    for (let dir = 0; dir < 4; dir++) {
+        const targetGrid = getTargetGrid(currentGridX, currentGridY, dir);
+        
+        // 그리드 범위 체크
+        if (targetGrid.x < -2 || targetGrid.x > 2 || targetGrid.y < -4 || targetGrid.y > 4) {
+            continue;
+        }
+        
+        const targetKey = `${targetGrid.x},${targetGrid.y}`;
+        const targetRoom = gameState.rooms.get(targetKey);
+        
+        // 인접한 방이 생성되어 있고, 그 방에 반대 방향에 문이 있는지 확인
+        if (targetRoom && targetRoom.generated && targetRoom.group) {
+            const oppositeDir = (dir + 2) % 4; // 반대 방향
+            
+            // 반대편 방에 반대 방향 문이 있는지 확인
+            if (targetRoom.doors.includes(oppositeDir)) {
+                // 반대편 방의 문 위치 계산
+                const targetRoomCenterX = targetGrid.x * ROOM_SIZE;
+                const targetRoomCenterZ = targetGrid.y * ROOM_SIZE;
+                
+                // 문의 월드 위치 계산 (벽 위치)
+                let doorWorldX, doorWorldZ;
+                if (oppositeDir === 0) { // 북쪽 벽
+                    doorWorldX = targetRoomCenterX;
+                    doorWorldZ = targetRoomCenterZ - ROOM_SIZE / 2;
+                } else if (oppositeDir === 1) { // 동쪽 벽
+                    doorWorldX = targetRoomCenterX + ROOM_SIZE / 2;
+                    doorWorldZ = targetRoomCenterZ;
+                } else if (oppositeDir === 2) { // 남쪽 벽
+                    doorWorldX = targetRoomCenterX;
+                    doorWorldZ = targetRoomCenterZ + ROOM_SIZE / 2;
+                } else { // 서쪽 벽
+                    doorWorldX = targetRoomCenterX - ROOM_SIZE / 2;
+                    doorWorldZ = targetRoomCenterZ;
+                }
+                
+                // 플레이어와 문 사이의 거리 계산
+                const distance = Math.sqrt(
+                    Math.pow(playerWorldPos.x - doorWorldX, 2) + 
+                    Math.pow(playerWorldPos.z - doorWorldZ, 2)
+                );
+                
+                // 거리가 가까우면 반대편 방의 문도 감지
+                if (distance < 2 && distance < minDistance) {
+                    // 반대편 방의 문 객체 찾기
+                    let foundDoor = null;
+                    targetRoom.group.traverse((child) => {
+                        if (child.userData && child.userData.isDoor && 
+                            child.userData.direction === oppositeDir) {
+                            foundDoor = child;
+                        }
+                    });
+                    
+                    if (foundDoor) {
+                        minDistance = distance;
+                        nearestDoor = foundDoor;
+                    }
+                }
+            }
+        }
+    }
     
     return nearestDoor;
 }
@@ -986,6 +1192,17 @@ function drawMapToCanvas(canvas, initialCellSize, padding, showLabels) {
                 else if (room.type.includes('t_')) color = '#7a7a9a';
                 else if (room.type === 'crossroad') color = '#8a8aaa';
                 
+                // 체크포인트가 있는 그리드 색상 표시
+                if (gameState.playerCheckpoint && 
+                    gameState.playerCheckpoint.gridX === gx && 
+                    gameState.playerCheckpoint.gridY === gy) {
+                    color = '#00ff00'; // 최북단은 초록색
+                } else if (gameState.aiCheckpoint && 
+                           gameState.aiCheckpoint.gridX === gx && 
+                           gameState.aiCheckpoint.gridY === gy) {
+                    color = '#ff0000'; // 최남단은 빨간색
+                }
+                
                 ctx.fillStyle = color;
                 ctx.fillRect(x + 2, y + 2, cellSize - 4, cellSize - 4);
                 
@@ -1030,7 +1247,19 @@ function drawMapToCanvas(canvas, initialCellSize, padding, showLabels) {
             } else {
                 // 방이 아직 생성되지 않은 경우 (미니맵에만 표시)
                 if (!showLabels) {
-                    ctx.fillStyle = '#2a2a3a';
+                    // 체크포인트가 있는 그리드 색상 표시
+                    let color = '#2a2a3a';
+                    if (gameState.playerCheckpoint && 
+                        gameState.playerCheckpoint.gridX === gx && 
+                        gameState.playerCheckpoint.gridY === gy) {
+                        color = '#00ff00'; // 최북단은 초록색
+                    } else if (gameState.aiCheckpoint && 
+                               gameState.aiCheckpoint.gridX === gx && 
+                               gameState.aiCheckpoint.gridY === gy) {
+                        color = '#ff0000'; // 최남단은 빨간색
+                    }
+                    
+                    ctx.fillStyle = color;
                     ctx.fillRect(x + 2, y + 2, cellSize - 4, cellSize - 4);
                     ctx.strokeStyle = '#444';
                     ctx.lineWidth = 1;
@@ -1076,8 +1305,8 @@ function drawMapToCanvas(canvas, initialCellSize, padding, showLabels) {
     // 플레이어가 그리드 범위 내에 있는지 확인
     if (playerMapX >= padding && playerMapX < canvas.width - padding && 
         playerMapY >= padding && playerMapY < canvas.height - padding) {
-        // 빨간색 원으로 플레이어 위치 표시 (방 네모 안에)
-        ctx.fillStyle = '#ff0000';
+        // 노란색 원으로 플레이어 위치 표시 (방 네모 안에)
+        ctx.fillStyle = '#ffff00';
         ctx.beginPath();
         ctx.arc(playerMapX, playerMapY, showLabels ? 5 : 3, 0, Math.PI * 2);
         ctx.fill();
@@ -1087,7 +1316,7 @@ function drawMapToCanvas(canvas, initialCellSize, padding, showLabels) {
         camera.getWorldDirection(cameraDirection);
         const angle = Math.atan2(cameraDirection.x, cameraDirection.z);
         
-        ctx.strokeStyle = '#ff0000';
+        ctx.strokeStyle = '#ffff00';
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.moveTo(playerMapX, playerMapY);
@@ -1160,6 +1389,7 @@ function drawMapToCanvas(canvas, initialCellSize, padding, showLabels) {
             }
         }
     }
+    
 }
 
 // 이동 처리
@@ -1234,34 +1464,83 @@ function handleMovement() {
         }
     });
     
-    // 경계 체크 (열린 문 방향은 여유 있게)
-    if (allowPassage && passageDirections.length > 0) {
-        const margin = 2.0;
-        let xMin = roomCenterX - halfSize;
-        let xMax = roomCenterX + halfSize;
-        let zMin = roomCenterZ - halfSize;
-        let zMax = roomCenterZ + halfSize;
+    // 경계 체크 (문이 있는 부분만 통과 가능)
+    // 기본적으로 모든 방향의 경계를 엄격하게 유지
+    let xMin = roomCenterX - halfSize;
+    let xMax = roomCenterX + halfSize;
+    let zMin = roomCenterZ - halfSize;
+    let zMax = roomCenterZ + halfSize;
+    
+    // 문의 폭 범위 (문은 각 방향의 벽 중앙에 위치)
+    const doorHalfWidth = DOOR_WIDTH / 2;
+    
+    // 각 방향에 대해 문이 있고 열려있는지 확인
+    for (let dir = 0; dir < 4; dir++) {
+        const hasDoor = gameState.currentRoom.doors.includes(dir);
+        const doorKey = `${gameState.currentRoom.gridX},${gameState.currentRoom.gridY},${dir}`;
+        const isOpen = gameState.openedDoors.has(doorKey);
         
-        passageDirections.forEach((passageDir) => {
-            if (passageDir === 0) { // 북 -> y 감소 = z 감소
-                zMin = Math.min(zMin, roomCenterZ - halfSize - margin);
-            } else if (passageDir === 1) { // 동
-                xMax = Math.max(xMax, roomCenterX + halfSize + margin);
-            } else if (passageDir === 2) { // 남 -> y 증가 = z 증가
-                zMax = Math.max(zMax, roomCenterZ + halfSize + margin);
-            } else if (passageDir === 3) { // 서
-                xMin = Math.min(xMin, roomCenterX - halfSize - margin);
+        // 문이 있고 열려있으면, 문의 폭 범위 내에서만 통과 가능하도록 체크
+        if (hasDoor && isOpen) {
+            const targetGrid = getTargetGrid(gameState.currentRoom.gridX, gameState.currentRoom.gridY, dir);
+            const targetRoom = gameState.rooms.get(`${targetGrid.x},${targetGrid.y}`);
+            
+            // 반대편 방도 생성되어 있고 문이 열려있는지 확인
+            if (targetRoom && targetRoom.generated) {
+                const oppositeDir = (dir + 2) % 4;
+                const targetDoorKey = `${targetGrid.x},${targetGrid.y},${oppositeDir}`;
+                if (gameState.openedDoors.has(targetDoorKey)) {
+                    // 이 방향으로 통과 가능하지만, 문의 폭 범위 내에 있을 때만
+                    const margin = 2.0; // 문 통과를 위한 여유 공간
+                    
+                    if (dir === 0) { // 북 -> y 감소 = z 감소
+                        // 북쪽 벽: z는 고정, x가 문의 폭 범위 내에 있을 때만 통과 가능
+                        const doorXMin = roomCenterX - doorHalfWidth;
+                        const doorXMax = roomCenterX + doorHalfWidth;
+                        if (camera.position.x >= doorXMin && camera.position.x <= doorXMax) {
+                            // 문의 폭 범위 내에 있으면 z 방향으로 통과 가능
+                            zMin = Math.min(zMin, roomCenterZ - halfSize - margin);
+                        }
+                    } else if (dir === 1) { // 동
+                        // 동쪽 벽: x는 고정, z가 문의 폭 범위 내에 있을 때만 통과 가능
+                        const doorZMin = roomCenterZ - doorHalfWidth;
+                        const doorZMax = roomCenterZ + doorHalfWidth;
+                        if (camera.position.z >= doorZMin && camera.position.z <= doorZMax) {
+                            // 문의 폭 범위 내에 있으면 x 방향으로 통과 가능
+                            xMax = Math.max(xMax, roomCenterX + halfSize + margin);
+                        }
+                    } else if (dir === 2) { // 남 -> y 증가 = z 증가
+                        // 남쪽 벽: z는 고정, x가 문의 폭 범위 내에 있을 때만 통과 가능
+                        const doorXMin = roomCenterX - doorHalfWidth;
+                        const doorXMax = roomCenterX + doorHalfWidth;
+                        if (camera.position.x >= doorXMin && camera.position.x <= doorXMax) {
+                            // 문의 폭 범위 내에 있으면 z 방향으로 통과 가능
+                            zMax = Math.max(zMax, roomCenterZ + halfSize + margin);
+                        }
+                    } else if (dir === 3) { // 서
+                        // 서쪽 벽: x는 고정, z가 문의 폭 범위 내에 있을 때만 통과 가능
+                        const doorZMin = roomCenterZ - doorHalfWidth;
+                        const doorZMax = roomCenterZ + doorHalfWidth;
+                        if (camera.position.z >= doorZMin && camera.position.z <= doorZMax) {
+                            // 문의 폭 범위 내에 있으면 x 방향으로 통과 가능
+                            xMin = Math.min(xMin, roomCenterX - halfSize - margin);
+                        }
+                    }
+                }
             }
-        });
+        }
+        // 문이 없거나 닫혀있으면 원래 경계 유지 (통과 불가)
+    }
+    
+    // 경계 제한 적용
+    camera.position.x = Math.max(xMin, Math.min(xMax, camera.position.x));
+    camera.position.z = Math.max(zMin, Math.min(zMax, camera.position.z));
+    
+    // 방 경계를 넘었는지 확인하고 방 전환 (열린 문 방향만, 문의 폭 범위 내에서만)
+    if (allowPassage && passageDirections.length > 0) {
+        const threshold = 0.5;
+        const doorHalfWidth = DOOR_WIDTH / 2;
         
-        const prevX = camera.position.x;
-        const prevZ = camera.position.z;
-        
-        camera.position.x = Math.max(xMin, Math.min(xMax, camera.position.x));
-        camera.position.z = Math.max(zMin, Math.min(zMax, camera.position.z));
-        
-        // 방 경계를 넘었는지 확인하고 방 전환
-        const threshold = 0.5; // threshold를 더 크게 조정하여 통과 감지 개선
         passageDirections.forEach((passageDir) => {
             const targetGrid = getTargetGrid(gameState.currentRoom.gridX, gameState.currentRoom.gridY, passageDir);
             const targetKey = `${targetGrid.x},${targetGrid.y}`;
@@ -1269,10 +1548,20 @@ function handleMovement() {
             
             if (!targetRoom || !targetRoom.generated) return;
             
+            // 문의 폭 범위 내에 있는지 확인
+            let inDoorRange = false;
+            if (passageDir === 0 || passageDir === 2) { // 북/남: x 좌표 체크
+                inDoorRange = camera.position.x >= roomCenterX - doorHalfWidth && 
+                             camera.position.x <= roomCenterX + doorHalfWidth;
+            } else { // 동/서: z 좌표 체크
+                inDoorRange = camera.position.z >= roomCenterZ - doorHalfWidth && 
+                             camera.position.z <= roomCenterZ + doorHalfWidth;
+            }
+            
+            if (!inDoorRange) return; // 문의 폭 범위 밖이면 방 전환 불가
+            
             let passed = false;
             if (passageDir === 0) { // 북 -> y 감소 = z 감소
-                // 북쪽 경계를 넘어섰는지 확인 (z가 방의 북쪽 경계보다 작아야 함)
-                // margin이 2.0이므로, 플레이어가 경계를 넘어서 이동할 수 있음
                 passed = camera.position.z <= roomCenterZ - halfSize + threshold;
             } else if (passageDir === 1) { // 동 -> x가 더 커짐
                 passed = camera.position.x >= roomCenterX + halfSize - threshold;
@@ -1286,10 +1575,6 @@ function handleMovement() {
                 moveToRoom(targetGrid.x, targetGrid.y);
             }
         });
-    } else {
-        // 일반 경계 체크
-        camera.position.x = Math.max(roomCenterX - halfSize, Math.min(roomCenterX + halfSize, camera.position.x));
-        camera.position.z = Math.max(roomCenterZ - halfSize, Math.min(roomCenterZ + halfSize, camera.position.z));
     }
 }
 
@@ -1317,13 +1602,65 @@ function updateDoorDetection() {
                 // 방 전환 체크는 handleMovement에서 처리
                 gameState.nearDoor = null;
             } else {
+                // 현재 방에 문이 있는지 확인 (현재 방에 문이 없으면 반대편 방의 문을 열 수 없음)
+                const currentRoom = gameState.currentRoom;
+                const doorDir = door.userData.direction;
+                
+                // 현재 방에 해당 방향의 문이 없으면 열 수 없음
+                if (!currentRoom.doors.includes(doorDir)) {
+                    gameState.nearDoor = null;
+                    return;
+                }
+                
                 // 문을 완전히 제거하고 통로만 남기기 (E키 불필요)
+                // 현재 방의 문도 제거 (반대편 방의 문을 열 때 현재 방의 문도 시각적으로 제거)
+                if (currentRoom && currentRoom.group) {
+                    const currentDoorsToRemove = [];
+                    const currentDoorFramesToRemove = new Set();
+                    
+                    currentRoom.group.traverse((child) => {
+                        if (child.userData) {
+                            // 현재 방의 문 찾기
+                            if (child.userData.isDoor && child.userData.direction === doorDir &&
+                                child.userData.gridX === currentRoom.gridX &&
+                                child.userData.gridY === currentRoom.gridY) {
+                                currentDoorsToRemove.push(child);
+                                if (child.userData.doorFrame) {
+                                    currentDoorFramesToRemove.add(child.userData.doorFrame);
+                                }
+                            }
+                            // 현재 방의 문 프레임 찾기
+                            if (child.userData.isDoorFrame && child.userData.doorDirection === doorDir) {
+                                currentDoorFramesToRemove.add(child);
+                            }
+                        }
+                    });
+                    
+                    // 현재 방의 문 제거
+                    currentDoorsToRemove.forEach(doorToRemove => {
+                        removeDoorCompletely(doorToRemove);
+                    });
+                    
+                    // 현재 방의 문 프레임 제거
+                    currentDoorFramesToRemove.forEach(frameToRemove => {
+                        if (frameToRemove && frameToRemove.parent) {
+                            frameToRemove.parent.remove(frameToRemove);
+                            if (frameToRemove.material) {
+                                frameToRemove.material.dispose();
+                            }
+                            if (frameToRemove.geometry) {
+                                frameToRemove.geometry.dispose();
+                            }
+                        }
+                    });
+                }
+                
+                // 반대편 방의 문도 제거 (문과 문 프레임 모두)
                 removeDoorCompletely(door);
                 gameState.openedDoors.add(doorKey);
-                // 반대편 문도 제거 (문과 문 프레임 모두)
-                const entranceAbsoluteDir = (door.userData.direction + 2) % 4;
                 const oppositeDoorKey = `${targetGrid.x},${targetGrid.y},${entranceAbsoluteDir}`;
                 gameState.openedDoors.add(oppositeDoorKey);
+                
                 if (targetRoom.group) {
                     const doorsToRemove = [];
                     const doorFramesToRemove = new Set();
@@ -1494,9 +1831,9 @@ function damagePlayer(damage) {
     playerState.health -= damage;
     if (playerState.health < 0) {
         playerState.health = 0;
-        // 게임 오버 처리 (선택사항)
     }
     updateUI();
+    checkGameEnd(); // 게임 종료 체크
 }
 
 // UI 업데이트
@@ -1506,8 +1843,6 @@ function updateUI() {
         ui.innerHTML = `
             <div>WASD: 이동 | 마우스: 시야 조절</div>
             <div>E: 새 방 생성 (방 종류 선택)</div>
-            <div>E: 맵 보기 (문 근처가 아닐 때)</div>
-            <div>ESC: 맵 닫기</div>
             <div style="margin-top: 10px; color: #ff0000;">체력: ${playerState.health}/${playerState.maxHealth}</div>
             <div style="color: #00ffff;">탄약: ${playerState.ammo}/${playerState.maxAmmo}</div>
         `;
@@ -1577,6 +1912,9 @@ function animate() {
         }
         
         updatePlayerBullets(); // 플레이어 총알 업데이트
+        
+        // 게임 종료 체크 (체크포인트 도착 및 사망)
+        checkGameEnd();
     }
     
     // AI 업데이트 (ai.js가 로드되었으면)
@@ -1592,6 +1930,12 @@ createStartRoom();
 drawMinimap(); // 초기 미니맵 그리기
 updateUI(); // 초기 UI 업데이트
 
+// 체크포인트 생성
+// 플레이어 목표: 최북단 (0, -4)
+gameState.playerCheckpoint = createCheckpoint(0, -4, true);
+// AI 목표: 최남단 (0, 4)
+gameState.aiCheckpoint = createCheckpoint(0, 4, false);
+
 // AI에서 사용할 함수들과 변수를 전역에 노출
 window.getTargetGrid = getTargetGrid;
 window.ROOM_SIZE = ROOM_SIZE;
@@ -1605,6 +1949,7 @@ window.removeDoorCompletely = removeDoorCompletely;
 window.camera = camera;
 window.damagePlayer = damagePlayer;
 window.playerState = playerState;
+window.checkGameEnd = checkGameEnd;
 
 // AI 초기화 (ai.js가 로드되었으면)
 setTimeout(() => {

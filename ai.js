@@ -188,6 +188,35 @@ function aiCreateRoom(gridX, gridY, fromDirection) {
         absoluteDoors.push(entranceAbsoluteDir);
     }
     
+    // 반대편 방의 문 상태를 확인하여 일치시키기 (메타 체크)
+    const directionNames = ['북', '동', '남', '서'];
+    for (let dir = 0; dir < 4; dir++) {
+        const oppositeGrid = getTargetGridFunc(gridX, gridY, dir);
+        const oppositeKey = `${oppositeGrid.x},${oppositeGrid.y}`;
+        const oppositeRoom = gameState.rooms.get(oppositeKey);
+        
+        // 반대편 방이 존재하고 생성되어 있으면
+        if (oppositeRoom && oppositeRoom.generated) {
+            const oppositeDir = (dir + 2) % 4; // 반대 방향
+            
+            // 반대편 방에 해당 방향에 문이 있으면, 새 방에도 그 방향에 문이 있어야 함
+            if (oppositeRoom.doors.includes(oppositeDir)) {
+                if (!absoluteDoors.includes(dir)) {
+                    absoluteDoors.push(dir);
+                    console.log(`AI 메타 체크: 반대편 방에 문이 있어서 새 방에도 ${directionNames[dir]} 방향 문 추가`);
+                }
+            } else {
+                // 반대편 방에 문이 없으면, 새 방에도 그 방향에 문이 없어야 함
+                const index = absoluteDoors.indexOf(dir);
+                if (index !== -1 && dir !== entranceAbsoluteDir) {
+                    // 입구는 제외하고 제거
+                    absoluteDoors.splice(index, 1);
+                    console.log(`AI 메타 체크: 반대편 방에 문이 없어서 새 방의 ${directionNames[dir]} 방향 문 제거`);
+                }
+            }
+        }
+    }
+    
     // 기존 빈 방 제거
     if (existingRoom && existingRoom.group) {
         scene.remove(existingRoom.group);
@@ -207,33 +236,123 @@ function aiCreateRoom(gridX, gridY, fromDirection) {
     const fromGrid = getTargetGridFunc ? getTargetGridFunc(gridX, gridY, (fromDirection + 2) % 4) : null;
     const fromRoom = fromGrid ? gameState.rooms.get(`${fromGrid.x},${fromGrid.y}`) : null;
     
-    // 현재 방에서 문 제거 (플레이어가 있는 방이 아닌 경우에만, 안전하게 처리)
+    // 현재 방에서 문 제거 (플레이어가 있는 방이어도 문을 제거)
     const removeDoorCompletelyFunc = window.removeDoorCompletely;
     if (fromGrid && fromRoom && fromRoom.generated && fromRoom.group && removeDoorCompletelyFunc) {
         try {
-            const currentPlayerRoom = gameState.currentRoom;
-            const isPlayerInFromRoom = currentPlayerRoom && 
-                                        currentPlayerRoom.gridX === fromGrid.x && 
-                                        currentPlayerRoom.gridY === fromGrid.y;
-            
-            // 플레이어가 있는 방이 아니면 문 제거
-            if (!isPlayerInFromRoom && fromRoom.group && typeof fromRoom.group.traverse === 'function') {
+            // 플레이어가 있는 방이어도 문을 제거 (시각적으로 즉시 열림)
+            if (fromRoom.group && typeof fromRoom.group.traverse === 'function') {
+                const doorsToRemove = [];
+                const doorFramesToRemove = new Set();
+                
                 fromRoom.group.traverse((child) => {
-                    if (child.userData && child.userData.isDoor && 
-                        child.userData.direction === fromDirection &&
-                        child.userData.gridX === fromGrid.x &&
-                        child.userData.gridY === fromGrid.y) {
-                        try {
-                            removeDoorCompletelyFunc(child);
-                        } catch (error) {
-                            console.error('AI 문 제거 오류:', error);
+                    if (child.userData) {
+                        if (child.userData.isDoor && 
+                            child.userData.direction === fromDirection &&
+                            child.userData.gridX === fromGrid.x &&
+                            child.userData.gridY === fromGrid.y) {
+                            doorsToRemove.push(child);
+                            if (child.userData.doorFrame) {
+                                doorFramesToRemove.add(child.userData.doorFrame);
+                            }
                         }
+                        if (child.userData.isDoorFrame && child.userData.doorDirection === fromDirection) {
+                            doorFramesToRemove.add(child);
+                        }
+                    }
+                });
+                
+                // 문 제거
+                doorsToRemove.forEach(doorToRemove => {
+                    try {
+                        removeDoorCompletelyFunc(doorToRemove);
+                    } catch (error) {
+                        console.error('AI 문 제거 오류:', error);
+                    }
+                });
+                
+                // 문 프레임 제거
+                doorFramesToRemove.forEach(frameToRemove => {
+                    try {
+                        if (frameToRemove && frameToRemove.parent) {
+                            frameToRemove.parent.remove(frameToRemove);
+                            if (frameToRemove.material) {
+                                frameToRemove.material.dispose();
+                            }
+                            if (frameToRemove.geometry) {
+                                frameToRemove.geometry.dispose();
+                            }
+                        }
+                    } catch (error) {
+                        console.error('AI 문 프레임 제거 오류:', error);
                     }
                 });
                 
                 // openedDoors에 추가
                 const doorKey = `${fromGrid.x},${fromGrid.y},${fromDirection}`;
                 gameState.openedDoors.add(doorKey);
+            }
+            
+            // 플레이어의 현재 방에서도 같은 방향의 문 제거 (양방향 통과 가능하도록)
+            // AI가 문을 열었을 때, 플레이어의 현재 방에서도 그 방향의 문이 열려있다면 시각적으로 제거
+            const currentPlayerRoom = gameState.currentRoom;
+            if (currentPlayerRoom && currentPlayerRoom.generated && currentPlayerRoom.group) {
+                const playerRoomGrid = { x: currentPlayerRoom.gridX, y: currentPlayerRoom.gridY };
+                
+                // 현재 방의 모든 문을 확인하여 openedDoors에 있는 문은 시각적으로 제거
+                currentPlayerRoom.doors.forEach((doorDir) => {
+                    const doorKey = `${playerRoomGrid.x},${playerRoomGrid.y},${doorDir}`;
+                    if (gameState.openedDoors.has(doorKey)) {
+                        // 열려있는 문은 시각적으로 제거
+                        const doorsToRemove = [];
+                        const doorFramesToRemove = new Set();
+                        
+                        currentPlayerRoom.group.traverse((child) => {
+                            if (child.userData) {
+                                if (child.userData.isDoor && 
+                                    child.userData.direction === doorDir &&
+                                    child.userData.gridX === playerRoomGrid.x &&
+                                    child.userData.gridY === playerRoomGrid.y) {
+                                    doorsToRemove.push(child);
+                                    if (child.userData.doorFrame) {
+                                        doorFramesToRemove.add(child.userData.doorFrame);
+                                    }
+                                }
+                                if (child.userData.isDoorFrame && child.userData.doorDirection === doorDir) {
+                                    doorFramesToRemove.add(child);
+                                }
+                            }
+                        });
+                        
+                        // 문 제거
+                        doorsToRemove.forEach(doorToRemove => {
+                            try {
+                                if (doorToRemove.parent) {
+                                    removeDoorCompletelyFunc(doorToRemove);
+                                }
+                            } catch (error) {
+                                console.error('플레이어 방 문 제거 오류:', error);
+                            }
+                        });
+                        
+                        // 문 프레임 제거
+                        doorFramesToRemove.forEach(frameToRemove => {
+                            try {
+                                if (frameToRemove && frameToRemove.parent) {
+                                    frameToRemove.parent.remove(frameToRemove);
+                                    if (frameToRemove.material) {
+                                        frameToRemove.material.dispose();
+                                    }
+                                    if (frameToRemove.geometry) {
+                                        frameToRemove.geometry.dispose();
+                                    }
+                                }
+                            } catch (error) {
+                                console.error('플레이어 방 문 프레임 제거 오류:', error);
+                            }
+                        });
+                    }
+                });
             }
         } catch (error) {
             console.error('AI 방 생성 중 문 제거 오류:', error);
@@ -273,6 +392,13 @@ function aiCreateRoom(gridX, gridY, fromDirection) {
                 try {
                     if (frameToRemove && frameToRemove.parent) {
                         frameToRemove.parent.remove(frameToRemove);
+                        // 문 프레임의 material과 geometry도 정리
+                        if (frameToRemove.material) {
+                            frameToRemove.material.dispose();
+                        }
+                        if (frameToRemove.geometry) {
+                            frameToRemove.geometry.dispose();
+                        }
                     }
                 } catch (error) {
                     console.error('AI 방 생성 중 문 프레임 제거 오류:', error);
@@ -881,6 +1007,19 @@ function checkPlayerAndShoot() {
     const camera = window.camera;
     if (!camera) return;
     
+    // 플레이어와 AI가 같은 방에 있는지 확인
+    const gameState = window.gameState;
+    if (!gameState || !gameState.currentRoom) return;
+    
+    const playerRoom = gameState.currentRoom;
+    const aiGridX = aiState.position.x;
+    const aiGridY = aiState.position.y;
+    
+    // 같은 방에 있지 않으면 발사하지 않음
+    if (playerRoom.gridX !== aiGridX || playerRoom.gridY !== aiGridY) {
+        return;
+    }
+    
     // 플레이어 위치
     const playerPos = new THREE.Vector3();
     camera.getWorldPosition(playerPos);
@@ -913,6 +1052,11 @@ function damageAI(damage) {
             aiState.mesh = null;
         }
         console.log('AI가 사망했습니다!');
+    }
+    
+    // 게임 종료 체크 (game.js의 checkGameEnd 호출)
+    if (window.checkGameEnd && typeof window.checkGameEnd === 'function') {
+        window.checkGameEnd();
     }
 }
 
